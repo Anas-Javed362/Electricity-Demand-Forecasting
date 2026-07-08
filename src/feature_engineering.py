@@ -50,7 +50,7 @@ def load_and_merge() -> pd.DataFrame:
             .bfill()
         )
     else:
-        print("⚠️  weather_hourly.csv not found – weather features will be zero.")
+        print("[WARNING] weather_hourly.csv not found - weather features will be zero.")
         df = df_energy.copy()
         df["temp"] = 10.0
         df["rhum"] = 60.0

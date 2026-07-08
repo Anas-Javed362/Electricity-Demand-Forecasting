@@ -234,11 +234,14 @@ def load_features():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_xgb_predictions():
+    # Try canonical filename first, then legacy fallback
     path = os.path.join(MODEL_DIR, "xgboost_model.joblib")
+    if not os.path.exists(path):
+        path = os.path.join(MODEL_DIR, "xgboost_model.pkl")
     if not os.path.exists(path):
         return None
     model = joblib.load(path)
-    _, _, _, X_test, y_test = _get_feature_sets()
+    df, X_train, y_train, X_test, y_test = load_features()
     preds = model.predict(X_test)
     return pd.Series(preds, index=y_test.index, name="XGBoost")
 
@@ -486,7 +489,7 @@ with tab2:
     if shap_values is None:
         st.info("Train XGBoost (`python src/train_xgboost.py`) to generate SHAP values.")
     else:
-        from src.feature_engineering import FEATURE_COLS
+        from src.feature_engineering import FEATURE_COLS  # canonical source
 
         mean_abs_shap = np.abs(shap_values).mean(axis=0)
         importance_df = (
@@ -652,54 +655,99 @@ with tab5:
         pred_wspd = st.number_input("💨 Wind Speed (km/h)", value=12.0, min_value=0.0, max_value=150.0, step=1.0)
 
     if st.button("⚡ Forecast Now", use_container_width=False):
-        model_path = os.path.join(MODEL_DIR, "xgboost_model.joblib")
-        if not os.path.exists(model_path):
-            st.error("XGBoost model not found. Run `python src/train_xgboost.py` first.")
-        else:
-            dt_str = f"{pred_date} {pred_hour:02d}:00"
+        dt_str = f"{pred_date} {pred_hour:02d}:00"
+        try:
+            forecast_mw = None
+            model_used = "xgboost"
+
+            # ── Strategy 1: call the FastAPI backend ────────────────────
             try:
-                from src.predict import predict as do_predict
+                import requests
+                api_url = os.environ.get("API_URL", "http://localhost:8000")
+                resp = requests.post(
+                    f"{api_url}/predict",
+                    json={"datetime": dt_str, "model": "xgboost"},
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    forecast_mw = data["forecast_mw"]
+                    model_used = data["model"]
+            except Exception:
+                pass  # API not reachable — fall through to local inference
 
-                result = do_predict(dt_str, pred_temp, pred_rhum, pred_wspd)
+            # ── Strategy 2: local direct inference ──────────────────────
+            if forecast_mw is None:
+                model_path = os.path.join(MODEL_DIR, "xgboost_model.joblib")
+                if not os.path.exists(model_path):
+                    model_path = os.path.join(MODEL_DIR, "xgboost_model.pkl")
+                if not os.path.exists(model_path):
+                    st.error("XGBoost model not found. Run `python src/train_xgboost.py` first.")
+                    st.stop()
 
-                st.markdown("---")
-                res_col1, res_col2, res_col3 = st.columns(3)
-                res_col1.metric("⚡ Forecast", f"{result['forecast_mw']:,.1f} MW")
-                res_col2.metric("📅 Datetime", dt_str)
-                res_col3.metric("🤖 Model", result["model"].title())
+                import holidays as hd
+                from src.feature_engineering import FEATURE_COLS as _FC
 
-                # Quick load range gauge
-                load_pct = min(result["forecast_mw"] / 60_000, 1.0) * 100
-                fig5 = go.Figure(
-                    go.Indicator(
-                        mode="gauge+number+delta",
-                        value=result["forecast_mw"],
-                        number={"suffix": " MW", "font": {"size": 28, "color": COLORS["actual"]}},
-                        gauge={
-                            "axis": {"range": [0, 60_000], "tickcolor": COLORS["muted"]},
-                            "bar": {"color": COLORS["xgboost"]},
-                            "bgcolor": COLORS["card"],
-                            "bordercolor": COLORS["border"],
-                            "steps": [
-                                {"range": [0, 20_000], "color": "#0e4429"},
-                                {"range": [20_000, 40_000], "color": "#1f6feb"},
-                                {"range": [40_000, 60_000], "color": "#6e1408"},
-                            ],
-                            "threshold": {
-                                "line": {"color": COLORS["actual"], "width": 3},
-                                "thickness": 0.75,
-                                "value": result["forecast_mw"],
-                            },
+                _us_hols = hd.US()
+                _dt = pd.Timestamp(dt_str)
+                _hour, _month = _dt.hour, _dt.month
+                _row = {
+                    "hour": _hour, "day_of_week": _dt.dayofweek,
+                    "month": _month, "quarter": (_month - 1) // 3 + 1,
+                    "day_of_year": _dt.dayofyear, "week_of_year": int(_dt.isocalendar()[1]),
+                    "is_weekend": int(_dt.dayofweek >= 5),
+                    "is_holiday": int(_dt.date() in _us_hols),
+                    "hour_sin": np.sin(2 * np.pi * _hour / 24),
+                    "hour_cos": np.cos(2 * np.pi * _hour / 24),
+                    "month_sin": np.sin(2 * np.pi * _month / 12),
+                    "month_cos": np.cos(2 * np.pi * _month / 12),
+                    "lag_1h": 32000.0, "lag_24h": 32000.0, "lag_168h": 32000.0,
+                    "rolling_mean_24h": 32000.0, "rolling_mean_168h": 32000.0,
+                    "rolling_std_24h": 6500.0,
+                    "temp": pred_temp, "rhum": pred_rhum, "wspd": pred_wspd,
+                    "temp_sq": pred_temp ** 2,
+                }
+                _xgb_model = joblib.load(model_path)
+                _X = pd.DataFrame([_row])[_FC]
+                forecast_mw = float(_xgb_model.predict(_X)[0])
+
+            # ── Display results ─────────────────────────────────────────
+            st.markdown("---")
+            res_col1, res_col2, res_col3 = st.columns(3)
+            res_col1.metric("⚡ Forecast", f"{forecast_mw:,.1f} MW")
+            res_col2.metric("📅 Datetime", dt_str)
+            res_col3.metric("🤖 Model", model_used.title())
+
+            fig5 = go.Figure(
+                go.Indicator(
+                    mode="gauge+number+delta",
+                    value=forecast_mw,
+                    number={"suffix": " MW", "font": {"size": 28, "color": COLORS["actual"]}},
+                    gauge={
+                        "axis": {"range": [0, 60_000], "tickcolor": COLORS["muted"]},
+                        "bar": {"color": COLORS["xgboost"]},
+                        "bgcolor": COLORS["card"],
+                        "bordercolor": COLORS["border"],
+                        "steps": [
+                            {"range": [0, 20_000], "color": "#0e4429"},
+                            {"range": [20_000, 40_000], "color": "#1f6feb"},
+                            {"range": [40_000, 60_000], "color": "#6e1408"},
+                        ],
+                        "threshold": {
+                            "line": {"color": COLORS["actual"], "width": 3},
+                            "thickness": 0.75,
+                            "value": forecast_mw,
                         },
-                        title={"text": "Forecasted Energy Load", "font": {"color": COLORS["text"]}},
-                    )
+                    },
+                    title={"text": "Forecasted Energy Load", "font": {"color": COLORS["text"]}},
                 )
-                fig5.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter", color=COLORS["text"]),
-                    height=320,
-                )
-                st.plotly_chart(fig5, use_container_width=True)
+            )
+            fig5.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="Inter", color=COLORS["text"]),
+                height=320,
+            )
+            st.plotly_chart(fig5, use_container_width=True)
 
-            except Exception as e:
-                st.error(f"Prediction failed: {e}")
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")

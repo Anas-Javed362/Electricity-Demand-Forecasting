@@ -29,6 +29,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.xgboost
+
+# ---------------------------------------------------------------------------
+# MLflow – absolute path avoids Windows URL-encoding issues.
+# MLFLOW_ALLOW_FILE_STORE is required by MLflow 3.x to use the file store.
+# ---------------------------------------------------------------------------
+os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+_MLRUNS_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "mlruns"))
+mlflow.set_tracking_uri(f"file:///{_MLRUNS_PATH}")
+
 import optuna
 import xgboost as xgb
 import shap
@@ -106,6 +115,7 @@ def train():
     df = build_feature_set()
     X_train, y_train, X_test, y_test = get_train_test(df)
     print(f"   Train: {len(X_train):,} rows  |  Test: {len(X_test):,} rows")
+    print(f"   Features ({len(FEATURE_COLS)}): {FEATURE_COLS}")
 
     with mlflow.start_run(run_name="xgboost_optuna") as run:
 
@@ -175,7 +185,7 @@ def train():
         )
 
         # ------------------------------------------------------------------
-        # Save model
+        # Save model — canonical filename: xgboost_model.joblib
         # ------------------------------------------------------------------
         model_path = os.path.join(MODEL_DIR, "xgboost_model.joblib")
         joblib.dump(model, model_path)

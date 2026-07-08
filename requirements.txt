@@ -19,3 +19,5 @@ uvicorn[standard]
 nbformat
 nbconvert
 ipykernel
+pyyaml
+requests

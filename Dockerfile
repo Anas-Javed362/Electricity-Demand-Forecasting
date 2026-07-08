@@ -21,11 +21,16 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.12 /usr/local/lib/python3.12
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy source
+# Copy ALL source code so the image is self-contained
 COPY src/  ./src/
 COPY api/  ./api/
+COPY app/  ./app/
 
-# Models volume will be mounted at runtime
+# Copy root-level dashboard (alternative entrypoint)
+COPY app.py ./app.py
+
+# Models, data and mlruns are mounted as volumes at runtime
+# (kept out of the image to avoid bloating the layer)
 VOLUME ["/app/models", "/app/data", "/app/mlruns"]
 
 ENV PYTHONUNBUFFERED=1

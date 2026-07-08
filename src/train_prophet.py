@@ -26,6 +26,15 @@ import numpy as np
 import pandas as pd
 import joblib
 import mlflow
+
+# ---------------------------------------------------------------------------
+# MLflow - absolute path avoids Windows URL-encoding issues.
+# MLFLOW_ALLOW_FILE_STORE is required by MLflow 3.x to use the file store.
+# ---------------------------------------------------------------------------
+os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"
+_MLRUNS_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "mlruns"))
+mlflow.set_tracking_uri(f"file:///{_MLRUNS_PATH}")
+
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from src.feature_engineering import build_feature_set, TRAIN_TEST_SPLIT_DATE

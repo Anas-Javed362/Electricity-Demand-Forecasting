@@ -4,9 +4,9 @@ src/train.py
 Trains ALL four models on real PJME_hourly.csv and writes:
   models/linear_model.pkl
   models/rf_model.pkl
-  models/xgboost_model.pkl
-  models/lstm_model.h5
-  models/lstm_scaler.pkl
+  models/xgboost_model.joblib   ← .joblib (canonical)
+  models/lstm_model.keras        ← .keras  (canonical)
+  models/lstm_scalers.joblib     ← scalers (canonical)
   models/metrics.json
 
 Usage
@@ -18,10 +18,14 @@ Models
   1. Linear Regression  (baseline)
   2. Random Forest Regressor
   3. XGBoost Regressor  (tuned: n_estimators, max_depth, learning_rate)
-  4. LSTM               (24-hr lookback, MinMaxScaler fit on train only)
+  4. LSTM               (168-hr lookback, MinMaxScaler fit on train only)
 
 All models evaluated on the same chronological test set.
 Metrics: MAE, RMSE, MAPE, R^2 -> models/metrics.json
+
+Feature pipeline
+----------------
+Uses src/feature_engineering.py (23 features) — the canonical single source of truth.
 """
 import os, sys, json, warnings
 warnings.filterwarnings("ignore")
@@ -42,15 +46,22 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
 import xgboost as xgb
 
-from src.utils import load_and_clean
-from src.features import get_xy, make_sequences, FEATURE_COLS, TARGET_COL
+# ---------------------------------------------------------------------------
+# Single source of truth for feature engineering
+# ---------------------------------------------------------------------------
+from src.feature_engineering import (
+    build_feature_set,
+    get_train_test,
+    FEATURE_COLS,
+    TARGET_COL,
+)
 
 MODELS_DIR = "models"
 IMAGES_DIR = "images"
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
-LSTM_LOOKBACK = 24   # hours
+LSTM_LOOKBACK = 168  # 1 week (matches train_lstm.py)
 LSTM_EPOCHS   = 20
 LSTM_BATCH    = 512
 
@@ -108,7 +119,7 @@ def plot_residuals(y_test, preds_dict, best_model):
 
 def plot_feature_importance(xgb_model):
     imp = pd.Series(xgb_model.feature_importances_, index=FEATURE_COLS).sort_values()
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 6))
     imp.plot(kind="barh", ax=ax, color="#2ca02c")
     ax.set_title("XGBoost Feature Importance")
     ax.set_xlabel("Importance")
@@ -124,7 +135,6 @@ def plot_model_comparison(metrics_dict):
     mapes = [metrics_dict[m]["MAPE"] for m in models]
 
     x = np.arange(len(models))
-    width = 0.25
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     for ax, vals, title, color in zip(
         axes,
@@ -191,7 +201,8 @@ def train_xgboost(X_train, y_train, X_test, y_test):
         verbose=False,
     )
     preds = model.predict(X_test)
-    joblib.dump(model, os.path.join(MODELS_DIR, "xgboost_model.pkl"))
+    # Canonical filename: xgboost_model.joblib
+    joblib.dump(model, os.path.join(MODELS_DIR, "xgboost_model.joblib"))
     return model, preds, compute_metrics(y_test, preds, "XGBoost")
 
 
@@ -209,6 +220,13 @@ def train_lstm(X_train, y_train, X_test, y_test):
     y_te_s = scaler_y.transform(y_test.values.reshape(-1, 1)).ravel()
 
     # Sequences
+    def make_sequences(X, y, seq_len):
+        Xs, ys = [], []
+        for i in range(len(X) - seq_len):
+            Xs.append(X[i : i + seq_len])
+            ys.append(y[i + seq_len])
+        return np.array(Xs), np.array(ys)
+
     X_tr_seq, y_tr_seq = make_sequences(X_tr_s, y_tr_s, LSTM_LOOKBACK)
     X_te_seq, y_te_seq = make_sequences(X_te_s, y_te_s, LSTM_LOOKBACK)
 
@@ -237,10 +255,10 @@ def train_lstm(X_train, y_train, X_test, y_test):
     # LSTM predictions are offset by LSTM_LOOKBACK
     y_test_aligned = y_test.values[LSTM_LOOKBACK:]
 
-    # Save model + scaler
-    model.save(os.path.join(MODELS_DIR, "lstm_model.h5"))
+    # Canonical filenames: lstm_model.keras + lstm_scalers.joblib
+    model.save(os.path.join(MODELS_DIR, "lstm_model.keras"))
     joblib.dump({"scaler_X": scaler_X, "scaler_y": scaler_y},
-                os.path.join(MODELS_DIR, "lstm_scaler.pkl"))
+                os.path.join(MODELS_DIR, "lstm_scalers.joblib"))
 
     m = compute_metrics(y_test_aligned, preds, "LSTM")
     return model, preds, m, len(y_test_aligned)
@@ -255,9 +273,12 @@ def main():
     print("PJM Energy Demand Forecasting – Training Pipeline")
     print("=" * 60)
 
-    # Load data
-    df = load_and_clean("data/PJME_hourly.csv")
-    X_train, y_train, X_test, y_test = get_xy(df)
+    # Load data using unified feature engineering pipeline
+    print("📊 Building feature set …")
+    df = build_feature_set()
+    X_train, y_train, X_test, y_test = get_train_test(df)
+    print(f"   Train: {len(X_train):,} rows  |  Test: {len(X_test):,} rows")
+    print(f"   Features ({len(FEATURE_COLS)}): {FEATURE_COLS}")
 
     metrics = {}
     preds_dict = {}
@@ -287,8 +308,6 @@ def main():
 
     # Evaluation plots
     print("\nGenerating evaluation plots...")
-    # Align LSTM preds with test set for comparison plots
-    # Use XGBoost for main plot (best tabular model typically)
     best_plot_model = "XGBoost" if "XGBoost" in preds_dict else best
     plot_actual_vs_pred(y_test, preds_dict, best_plot_model)
     plot_residuals(y_test, preds_dict, best_plot_model)

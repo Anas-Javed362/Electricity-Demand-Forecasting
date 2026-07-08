@@ -6,6 +6,18 @@ Cross-model evaluation on the held-out test set.
 Loads all trained models from models/ and evaluates them on the same
 chronological test set (2017-01-01 onward) used during training.
 
+Feature pipeline
+----------------
+Uses src/feature_engineering.py (23 features) — the canonical single source of truth.
+
+Model filenames (canonical)
+---------------------------
+  xgboost_model.joblib   (falls back to xgboost_model.pkl)
+  rf_model.pkl
+  linear_model.pkl
+  lstm_model.keras       (falls back to lstm_model.h5)
+  lstm_scalers.joblib    (falls back to lstm_scaler.pkl)
+
 Outputs
 -------
   - Console table: MAE / RMSE / MAPE / R² for each model
@@ -27,10 +39,13 @@ import pandas as pd
 import joblib
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from src.utils    import load_and_clean
-from src.features import get_xy, make_sequences, FEATURE_COLS
+# ---------------------------------------------------------------------------
+# Single source of truth for feature engineering
+# ---------------------------------------------------------------------------
+from src.feature_engineering import build_feature_set, get_train_test, FEATURE_COLS
 
 MODEL_DIR = "models"
+
 
 # ── Metric helpers ────────────────────────────────────────────────────────────
 
@@ -48,46 +63,72 @@ def _metrics(y_true, y_pred, name):
     return {"MAE": round(mae, 2), "RMSE": round(rmse, 2), "MAPE": round(mp, 4), "R2": round(r2, 4)}
 
 
+def _try_paths(*paths):
+    """Return the first existing path from the list, or None."""
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 # ── Individual evaluators ─────────────────────────────────────────────────────
 
 def eval_linear(X_test, y_test):
-    p = os.path.join(MODEL_DIR, "linear_model.pkl")
-    if not os.path.exists(p):
+    p = _try_paths(os.path.join(MODEL_DIR, "linear_model.pkl"))
+    if not p:
         print("  [SKIP] linear_model.pkl not found."); return None
     model = joblib.load(p)
     return _metrics(y_test, model.predict(X_test), "Linear Regression")
 
 def eval_rf(X_test, y_test):
-    p = os.path.join(MODEL_DIR, "rf_model.pkl")
-    if not os.path.exists(p):
+    p = _try_paths(os.path.join(MODEL_DIR, "rf_model.pkl"))
+    if not p:
         print("  [SKIP] rf_model.pkl not found."); return None
     model = joblib.load(p)
     return _metrics(y_test, model.predict(X_test), "Random Forest")
 
 def eval_xgboost(X_test, y_test):
-    p = os.path.join(MODEL_DIR, "xgboost_model.pkl")
-    if not os.path.exists(p):
-        print("  [SKIP] xgboost_model.pkl not found."); return None
+    # Try canonical (.joblib) first, fall back to legacy (.pkl)
+    p = _try_paths(
+        os.path.join(MODEL_DIR, "xgboost_model.joblib"),
+        os.path.join(MODEL_DIR, "xgboost_model.pkl"),
+    )
+    if not p:
+        print("  [SKIP] xgboost_model.joblib / .pkl not found."); return None
     model = joblib.load(p)
     return _metrics(y_test, model.predict(X_test), "XGBoost")
 
 def eval_lstm(X_test, y_test):
-    mp = os.path.join(MODEL_DIR, "lstm_model.h5")
-    sp = os.path.join(MODEL_DIR, "lstm_scaler.pkl")
-    if not os.path.exists(mp) or not os.path.exists(sp):
-        print("  [SKIP] lstm_model.h5 or lstm_scaler.pkl not found."); return None
+    # Try canonical filenames first, fall back to legacy
+    mp = _try_paths(
+        os.path.join(MODEL_DIR, "lstm_model.keras"),
+        os.path.join(MODEL_DIR, "lstm_model.h5"),
+    )
+    sp = _try_paths(
+        os.path.join(MODEL_DIR, "lstm_scalers.joblib"),
+        os.path.join(MODEL_DIR, "lstm_scaler.pkl"),
+    )
+    if not mp or not sp:
+        print("  [SKIP] lstm_model.keras / lstm_scalers.joblib not found."); return None
     try:
         import tensorflow as tf
-        scalers  = joblib.load(sp)
-        model    = tf.keras.models.load_model(mp, compile=False)
+        scalers = joblib.load(sp)
+        model   = tf.keras.models.load_model(mp, compile=False)
 
-        LOOKBACK = 24
+        # Must match SEQUENCE_LEN in train_lstm.py
+        LOOKBACK = 24  # 24-hour look-back
         X_s = scalers["scaler_X"].transform(X_test.values)
-        y_s = scalers["scaler_y"].transform(y_test.values.reshape(-1,1)).ravel()
+        y_s = scalers["scaler_y"].transform(y_test.values.reshape(-1, 1)).ravel()
 
-        Xs, ys = make_sequences(X_s, y_s, LOOKBACK)
+        # Create sequences
+        Xs, ys = [], []
+        for i in range(len(X_s) - LOOKBACK):
+            Xs.append(X_s[i : i + LOOKBACK])
+            ys.append(y_s[i + LOOKBACK])
+        Xs = np.array(Xs)
+
         preds_s = model.predict(Xs, verbose=0).ravel()
-        preds   = scalers["scaler_y"].inverse_transform(preds_s.reshape(-1,1)).ravel()
+        preds   = scalers["scaler_y"].inverse_transform(preds_s.reshape(-1, 1)).ravel()
         y_aligned = y_test.values[LOOKBACK:]
         return _metrics(y_aligned, preds, "LSTM")
     except Exception as e:
@@ -102,9 +143,11 @@ def main():
     print("  PJM Energy Demand Forecasting — Model Evaluation")
     print(sep)
 
-    df = load_and_clean("data/PJME_hourly.csv")
-    X_train, y_train, X_test, y_test = get_xy(df)
-    print(f"  Test set: {len(X_test):,} rows  ({X_test.index.min().date()} -> {X_test.index.max().date()})\n")
+    # Use unified feature engineering pipeline
+    df = build_feature_set()
+    X_train, y_train, X_test, y_test = get_train_test(df)
+    print(f"  Features  : {len(FEATURE_COLS)} columns")
+    print(f"  Test set  : {len(X_test):,} rows  ({X_test.index.min().date()} -> {X_test.index.max().date()})\n")
 
     results = {}
 

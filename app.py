@@ -1,5 +1,5 @@
 """
-app.py – Streamlit dashboard for PJM Electricity Demand Forecasting
+app.py – Streamlit dashboard for Electricity Demand Forecasting
 ===================================================================
 Run:  streamlit run app.py
 
@@ -13,6 +13,18 @@ Features
     * Best-model badge
 - Models loaded once at startup (no retraining per interaction)
 - Graceful error if a model file is missing (clear on-screen message, no crash)
+
+Feature pipeline
+----------------
+Uses src/feature_engineering.py (23 features) — the canonical single source of truth.
+
+Model filenames (canonical)
+---------------------------
+  xgboost_model.joblib  (falls back to xgboost_model.pkl)
+  rf_model.pkl
+  linear_model.pkl
+  lstm_model.keras       (falls back to lstm_model.h5)
+  lstm_scalers.joblib    (falls back to lstm_scaler.pkl)
 """
 import os, sys, json, warnings
 warnings.filterwarnings("ignore")
@@ -28,7 +40,7 @@ import plotly.graph_objects as go
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="PJM Energy Demand Forecasting",
+    page_title="Electricity Demand Forecasting",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -158,11 +170,12 @@ MODELS_DIR   = "models"
 DATA_PATH    = "data/PJME_hourly.csv"
 METRICS_PATH = os.path.join(MODELS_DIR, "metrics.json")
 
+# Canonical model filenames — .joblib preferred for XGBoost/LSTM
 MODEL_FILES = {
-    "Linear Regression": "linear_model.pkl",
-    "Random Forest":     "rf_model.pkl",
-    "XGBoost":           "xgboost_model.pkl",
-    "LSTM":              "lstm_model.h5",
+    "Linear Regression": ["linear_model.pkl"],
+    "Random Forest":     ["rf_model.pkl"],
+    "XGBoost":           ["xgboost_model.joblib", "xgboost_model.pkl"],
+    "LSTM":              ["lstm_model.keras", "lstm_model.h5"],
 }
 
 COLORS = {
@@ -209,17 +222,23 @@ PLOTLY_LAYOUT = dict(
 
 @st.cache_data(show_spinner="Loading dataset...")
 def _load_data():
-    from src.utils import load_and_clean
-    from src.features import build_features
-    df   = load_and_clean(DATA_PATH)
-    feat = build_features(df)
-    return df, feat
+    """Load and build feature set using the canonical feature_engineering pipeline."""
+    from src.feature_engineering import build_feature_set, get_train_test, FEATURE_COLS, TARGET_COL
+    df_feat = build_feature_set()
+    return df_feat, FEATURE_COLS, TARGET_COL
+
+def _find_model_path(model_name: str):
+    """Return the first existing path from the canonical/fallback list, or None."""
+    for fname in MODEL_FILES[model_name]:
+        path = os.path.join(MODELS_DIR, fname)
+        if os.path.exists(path):
+            return path
+    return None
 
 @st.cache_resource(show_spinner=False)
 def _load_model(model_name: str):
-    fname = MODEL_FILES[model_name]
-    path  = os.path.join(MODELS_DIR, fname)
-    if not os.path.exists(path):
+    path = _find_model_path(model_name)
+    if path is None:
         return None
     if model_name == "LSTM":
         import tensorflow as tf
@@ -228,8 +247,12 @@ def _load_model(model_name: str):
 
 @st.cache_resource(show_spinner=False)
 def _load_lstm_scalers():
-    p = os.path.join(MODELS_DIR, "lstm_scaler.pkl")
-    return joblib.load(p) if os.path.exists(p) else None
+    # Try canonical filename first, then legacy fallback
+    for fname in ["lstm_scalers.joblib", "lstm_scaler.pkl"]:
+        p = os.path.join(MODELS_DIR, fname)
+        if os.path.exists(p):
+            return joblib.load(p)
+    return None
 
 @st.cache_data(show_spinner=False)
 def _load_metrics():
@@ -241,15 +264,19 @@ def _load_metrics():
 
 # ── Prediction helpers ───────────────────────────────────────────────────────
 
-def _predict_tabular(model, feat_df):
-    from src.features import FEATURE_COLS
-    return model.predict(feat_df[FEATURE_COLS])
+def _predict_tabular(model, feat_df, feature_cols):
+    return model.predict(feat_df[feature_cols])
 
-def _predict_lstm(model, scalers, feat_df):
-    from src.features import FEATURE_COLS, make_sequences
-    X = scalers["scaler_X"].transform(feat_df[FEATURE_COLS].values)
+def _predict_lstm(model, scalers, feat_df, feature_cols):
+    from src.feature_engineering import FEATURE_COLS
+    LOOKBACK = 24  # Must match SEQUENCE_LEN in train_lstm.py
+    X = scalers["scaler_X"].transform(feat_df[feature_cols].values)
     y_dummy = np.zeros(len(X))
-    Xs, _   = make_sequences(X, y_dummy, 24)
+    # Create sequences
+    Xs = []
+    for i in range(len(X) - LOOKBACK):
+        Xs.append(X[i : i + LOOKBACK])
+    Xs = np.array(Xs)
     preds_s = model.predict(Xs, verbose=0).ravel()
     return scalers["scaler_y"].inverse_transform(preds_s.reshape(-1, 1)).ravel()
 
@@ -266,10 +293,11 @@ if not os.path.exists(DATA_PATH):
     st.error("data/PJME_hourly.csv not found. Run download_data.py or place the file manually.")
     st.stop()
 
-df, feat_df = _load_data()
+feat_df, FEATURE_COLS, TARGET_COL = _load_data()
 metrics_all = _load_metrics()
-from src.features import TRAIN_CUTOFF, TARGET_COL, FEATURE_COLS
-test_feat = feat_df[feat_df.index >= TRAIN_CUTOFF]
+
+from src.feature_engineering import TRAIN_TEST_SPLIT_DATE
+test_feat   = feat_df[feat_df.index >= TRAIN_TEST_SPLIT_DATE]
 test_actual = test_feat[TARGET_COL]
 
 
@@ -279,8 +307,7 @@ with st.sidebar:
     st.markdown("## ⚡ PJM Forecasting")
     st.markdown("---")
 
-    available = [m for m in MODEL_FILES if
-                 os.path.exists(os.path.join(MODELS_DIR, MODEL_FILES[m]))]
+    available = [m for m in MODEL_FILES if _find_model_path(m) is not None]
     if not available:
         st.warning("No trained models found.\nRun: `python src/train.py`")
         st.stop()
@@ -318,11 +345,13 @@ st.markdown("---")
 
 # ── KPI cards ────────────────────────────────────────────────────────────────
 
+# Use raw load data for KPI display
+_raw_load = feat_df[TARGET_COL]
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total Hours", f"{len(df):,}")
-k2.metric("Avg Load",    f"{df[TARGET_COL].mean():,.0f} MW")
-k3.metric("Peak Load",   f"{df[TARGET_COL].max():,.0f} MW")
-k4.metric("Min Load",    f"{df[TARGET_COL].min():,.0f} MW")
+k1.metric("Total Hours", f"{len(feat_df):,}")
+k2.metric("Avg Load",    f"{_raw_load.mean():,.0f} MW")
+k3.metric("Peak Load",   f"{_raw_load.max():,.0f} MW")
+k4.metric("Min Load",    f"{_raw_load.min():,.0f} MW")
 
 st.markdown("---")
 
@@ -330,23 +359,25 @@ st.markdown("---")
 
 model = _load_model(model_name)
 if model is None:
-    st.warning(f"Model file for **{model_name}** not found in `{MODELS_DIR}/`. "
+    tried = ", ".join(MODEL_FILES[model_name])
+    st.warning(f"Model file for **{model_name}** not found (`{tried}`). "
                f"Run `python src/train.py` first.")
     st.stop()
 
 with st.spinner(f"Running {model_name} predictions on test set..."):
+    LOOKBACK = 168
     if model_name == "LSTM":
         scalers  = _load_lstm_scalers()
         if scalers is None:
-            st.error("lstm_scaler.pkl not found. Re-run `python src/train.py`.")
+            st.error("lstm_scalers.joblib not found. Re-run `python src/train.py`.")
             st.stop()
-        raw_preds = _predict_lstm(model, scalers, test_feat)
+        raw_preds = _predict_lstm(model, scalers, test_feat, FEATURE_COLS)
         # LSTM preds offset by lookback
-        pred_index = test_actual.index[24:]
+        pred_index = test_actual.index[LOOKBACK:]
         pred_series = pd.Series(raw_preds, index=pred_index)
-        actual_aligned = test_actual[24:]
+        actual_aligned = test_actual[LOOKBACK:]
     else:
-        raw_preds = _predict_tabular(model, test_feat)
+        raw_preds = _predict_tabular(model, test_feat, FEATURE_COLS)
         pred_series = pd.Series(raw_preds, index=test_actual.index)
         actual_aligned = test_actual
 
@@ -368,7 +399,7 @@ fig.add_trace(go.Scatter(x=pred_slice.index, y=pred_slice.values,
                                                       width=1.5, dash="dot")))
 fig.update_layout(**PLOTLY_LAYOUT, title="Actual vs Predicted (MW)",
                    xaxis_title="Date", yaxis_title="Load (MW)", height=420, hovermode="x unified")
-st.plotly_chart(fig, width='stretch')
+st.plotly_chart(fig, use_container_width=True)
 
 # ── Metrics cards ─────────────────────────────────────────────────────────────
 
@@ -406,13 +437,13 @@ with st.spinner(f"Generating {fc_hours}-hour recursive forecast..."):
                            title=f"Next {fc_hours}h Forecast (MW)",
                            xaxis_title="Datetime", yaxis_title="Load (MW)",
                            height=360, hovermode="x unified")
-        st.plotly_chart(fig2, width='stretch')
+        st.plotly_chart(fig2, use_container_width=True)
 
         fc_df = fc_series.reset_index()
         fc_df.columns = ["Datetime", "Forecasted MW"]
         fc_df["Datetime"] = fc_df["Datetime"].dt.strftime("%Y-%m-%d %H:%M")
         fc_df["Forecasted MW"] = fc_df["Forecasted MW"].round(1)
-        st.dataframe(fc_df, width='stretch', hide_index=True)
+        st.dataframe(fc_df, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Forecast failed: {e}")
 
@@ -434,10 +465,10 @@ if metrics_all:
         comp_df.style.apply(highlight_best, axis=1).format(
             {"MAE (MW)": "{:.1f}", "RMSE (MW)": "{:.1f}", "MAPE (%)": "{:.2f}", "R2": "{:.4f}"}
         ),
-        width='stretch', hide_index=True
+        use_container_width=True, hide_index=True
     )
 
     # Saved comparison chart
     img_path = os.path.join("images", "model_comparison.png")
     if os.path.exists(img_path):
-        st.image(img_path, caption="Model Comparison Chart", width='stretch')
+        st.image(img_path, caption="Model Comparison Chart", use_container_width=True)
